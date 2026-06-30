@@ -41,10 +41,14 @@ struct ResultView: View {
         VStack(spacing: 16) {
             // Image
             if let uiImage = image {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .scaledToFill()
+                Color.clear
+                    .frame(maxWidth: .infinity)
                     .frame(height: 200)
+                    .overlay {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                    }
                     .clipShape(RoundedRectangle(cornerRadius: 16))
             }
 

@@ -1,15 +1,106 @@
 import UIKit
 import CoreImage
+import Vision
+
+// MARK: - Image Content Assessment
+
+struct ImageContentAssessment: Sendable {
+    let classifications: [(label: String, confidence: Float)]
+    let colors: String
+    let dimensions: String
+    let brightness: String
+    let aspectRatio: String
+
+    var topSubjectLabel: String? {
+        classifications.first?.label
+    }
+
+    var detectedSubjectSummary: String {
+        guard !classifications.isEmpty else { return "식별 불가" }
+        return classifications
+            .prefix(5)
+            .map { "\($0.label) (\(Int($0.confidence * 100))%)" }
+            .joined(separator: ", ")
+    }
+
+    var fishConfidence: Float {
+        classifications
+            .filter { Self.matchesFishLabel($0.label) }
+            .map(\.confidence)
+            .max() ?? 0
+    }
+
+    var nonFishFoodConfidence: Float {
+        classifications
+            .filter { Self.matchesNonFishFoodLabel($0.label) }
+            .map(\.confidence)
+            .max() ?? 0
+    }
+
+    var shouldRejectAsNonFish: Bool {
+        guard !classifications.isEmpty else { return false }
+        return nonFishFoodConfidence >= 0.12 && fishConfidence < 0.08
+    }
+
+    var promptDescription: String {
+        let classificationBlock: String
+        if classifications.isEmpty {
+            classificationBlock = "Vision classification: unavailable (use color signals only)"
+        } else {
+            let lines = classifications.prefix(8).map {
+                "- \($0.label): \(String(format: "%.0f", $0.confidence * 100))%"
+            }
+            classificationBlock = """
+            Vision image classification (primary subject evidence):
+            \(lines.joined(separator: "\n"))
+            """
+        }
+
+        return """
+        === IMAGE SIGNALS ===
+        \(classificationBlock)
+
+        Dimensions: \(dimensions)
+        Brightness: \(brightness)
+        Framing: \(aspectRatio)
+        Color analysis by region: \(colors)
+        === END IMAGE SIGNALS ===
+        """
+    }
+
+    private static func matchesFishLabel(_ label: String) -> Bool {
+        let normalized = label.lowercased().replacingOccurrences(of: "_", with: " ")
+        let fishKeywords = [
+            "fish", "seafood", "salmon", "tuna", "mackerel", "cod", "trout", "sardine",
+            "anchovy", "herring", "snapper", "bass", "carp", "eel", "squid", "octopus",
+            "shrimp", "prawn", "crab", "lobster", "shellfish", "oyster", "clam", "mussel",
+            "scallop", "roe", "sashimi", "sea bream", "flatfish", "sole", "halibut",
+            "perch", "pike", "mullet", "seafood market"
+        ]
+        return fishKeywords.contains { normalized.contains($0) }
+    }
+
+    private static func matchesNonFishFoodLabel(_ label: String) -> Bool {
+        let normalized = label.lowercased().replacingOccurrences(of: "_", with: " ")
+        let nonFishKeywords = [
+            "meat", "beef", "pork", "chicken", "poultry", "lamb", "steak", "patty",
+            "burger", "rib", "meatball", "sausage", "ham", "bacon", "grill", "barbecue",
+            "bbq", "cooked", "dish", "meal", "dinner", "lunch", "cuisine", "vegetable",
+            "fruit", "bread", "dessert", "cake", "pasta", "rice", "noodle", "sandwich",
+            "pizza", "soup", "stew", "fried", "roast", "processed food", "prepared food"
+        ]
+        return nonFishKeywords.contains { normalized.contains($0) }
+    }
+}
 
 // MARK: - Vision Preprocessing Service
 
 nonisolated struct VisionPreprocessingService: Sendable {
 
-    /// Lightweight image description using CoreImage only.
-    /// Avoids Vision ML requests that compete with Foundation Models for the Neural Engine.
-    func extractDescription(from image: UIImage) -> String {
+    func assessImageContent(from image: UIImage) async -> ImageContentAssessment {
         guard let cgImage = image.cgImage else {
-            return buildDescription(
+            return ImageContentAssessment(
+                classifications: [],
                 colors: "unknown",
                 dimensions: "invalid image",
                 brightness: "unknown",
@@ -17,16 +108,56 @@ nonisolated struct VisionPreprocessingService: Sendable {
             )
         }
 
+        let classifications = await classifyImage(
+            cgImage,
+            orientation: cgImageOrientation(for: image)
+        )
         let colors = analyzeColors(cgImage)
         let dimensions = "\(cgImage.width)x\(cgImage.height) px"
         let brightness = describeOverallBrightness(cgImage)
         let aspectRatio = describeAspectRatio(width: cgImage.width, height: cgImage.height)
-        return buildDescription(
+
+        return ImageContentAssessment(
+            classifications: classifications,
             colors: colors,
             dimensions: dimensions,
             brightness: brightness,
             aspectRatio: aspectRatio
         )
+    }
+
+    // MARK: - Vision Classification
+
+    private func classifyImage(
+        _ cgImage: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) async -> [(label: String, confidence: Float)] {
+        let request = ClassifyImageRequest(.revision2)
+        let handler = ImageRequestHandler(cgImage, orientation: orientation)
+
+        do {
+            let results = try await handler.perform(request)
+            return results
+                .sorted { $0.confidence > $1.confidence }
+                .prefix(10)
+                .map { ($0.identifier, $0.confidence) }
+        } catch {
+            return []
+        }
+    }
+
+    private func cgImageOrientation(for image: UIImage) -> CGImagePropertyOrientation {
+        switch image.imageOrientation {
+        case .up: return .up
+        case .down: return .down
+        case .left: return .left
+        case .right: return .right
+        case .upMirrored: return .upMirrored
+        case .downMirrored: return .downMirrored
+        case .leftMirrored: return .leftMirrored
+        case .rightMirrored: return .rightMirrored
+        @unknown default: return .up
+        }
     }
 
     // MARK: - Color Analysis
@@ -120,23 +251,6 @@ nonisolated struct VisionPreprocessingService: Sendable {
         if ratio > 1.4 { return "landscape/wide shot" }
         if ratio < 0.75 { return "portrait/tall shot" }
         return "square-ish/standard shot"
-    }
-
-    private func buildDescription(
-        colors: String,
-        dimensions: String,
-        brightness: String,
-        aspectRatio: String
-    ) -> String {
-        """
-        === IMAGE SIGNALS ===
-        Dimensions: \(dimensions)
-        Brightness: \(brightness)
-        Framing: \(aspectRatio)
-        Color analysis by region: \(colors)
-        Note: Photo appears usable for food freshness inspection. Provide your best assessment from these signals.
-        === END IMAGE SIGNALS ===
-        """
     }
 }
 

@@ -10,15 +10,15 @@ actor FreshnessAnalysisService {
 
     private var languageModel: SystemLanguageModel {
         SystemLanguageModel(
-            useCase: .contentTagging,
+            useCase: .general,
             guardrails: .permissiveContentTransformations
         )
     }
 
     private var generationOptions: GenerationOptions {
         GenerationOptions(
-            sampling: .greedy,
-            temperature: 0.2,
+            sampling: .random(probabilityThreshold: 0.9),
+            temperature: 0.5,
             maximumResponseTokens: 2_048
         )
     }
@@ -32,8 +32,13 @@ actor FreshnessAnalysisService {
             image,
             maxDimension: ImageProcessing.analysisMaxDimension
         )
-        let imageDescription = visionService.extractDescription(from: analysisImage)
-        let userPrompt = buildUserPrompt(imageDescription: imageDescription, fishHint: fishHint)
+        let assessment = await visionService.assessImageContent(from: analysisImage)
+
+        if assessment.shouldRejectAsNonFish {
+            throw AnalysisError.notFishProduct(assessment.detectedSubjectSummary)
+        }
+
+        let userPrompt = buildUserPrompt(assessment: assessment, fishHint: fishHint)
         let systemPrompt = loadSystemPrompt()
 
         var lastError: Error?
@@ -46,20 +51,31 @@ actor FreshnessAnalysisService {
             let session = makeSession(instructions: systemPrompt)
 
             do {
-                return try await respondWithGuidedGeneration(
+                let result = try await respondWithGuidedGeneration(
                     session: session,
                     prompt: userPrompt
                 )
+                if !result.isLowQuality {
+                    return result
+                }
+                print("[FreshnessAnalysis] Low quality guided result, retrying with JSON fallback")
+                lastError = AnalysisError.aiResponseInvalid
             } catch {
                 lastError = error
-                do {
-                    return try await respondWithJSONFallback(
-                        session: makeSession(instructions: systemPrompt),
-                        prompt: userPrompt
-                    )
-                } catch {
-                    lastError = error
+            }
+
+            do {
+                let result = try await respondWithJSONFallback(
+                    session: makeSession(instructions: systemPrompt),
+                    prompt: userPrompt
+                )
+                if !result.isLowQuality {
+                    return result
                 }
+                print("[FreshnessAnalysis] Low quality JSON fallback result, retrying...")
+                lastError = AnalysisError.aiResponseInvalid
+            } catch {
+                lastError = error
             }
         }
 
@@ -75,10 +91,11 @@ actor FreshnessAnalysisService {
         let response = try await session.respond(
             to: prompt,
             generating: FreshnessAnalysisResult.self,
-            includeSchemaInPrompt: false,
             options: generationOptions
         )
-        return response.content.normalized()
+        let result = response.content.normalized()
+        logAIResult(result, source: "guided generation")
+        return result
     }
 
     private func respondWithJSONFallback(
@@ -104,7 +121,20 @@ actor FreshnessAnalysisService {
             options: generationOptions
         )
 
-        return try parseJSONResult(from: response.content).normalized()
+        print("[FreshnessAnalysis] AI raw response (JSON fallback):\n\(response.content)")
+
+        let result = try parseJSONResult(from: response.content).normalized()
+        logAIResult(result, source: "JSON fallback")
+        return result
+    }
+
+    private func logAIResult(_ result: FreshnessAnalysisResult, source: String) {
+        if let data = try? JSONEncoder().encode(result),
+           let json = String(data: data, encoding: .utf8) {
+            print("[FreshnessAnalysis] AI result (\(source)):\n\(json)")
+        } else {
+            print("[FreshnessAnalysis] AI result (\(source)): \(result.fishSpecies), score=\(result.overallScore), grade=\(result.grade.rawValue)")
+        }
     }
 
     private func makeSession(instructions: String) -> LanguageModelSession {
@@ -115,30 +145,22 @@ actor FreshnessAnalysisService {
 
     // MARK: - Prompt Building
 
-    private func buildUserPrompt(imageDescription: String, fishHint: String?) -> String {
-        var prompt = """
-        You are evaluating a fish product photo for a consumer food safety app.
-        This is a normal food market freshness inspection task.
+    private func buildUserPrompt(assessment: ImageContentAssessment, fishHint: String?) -> String {
+        var prompt = assessment.promptDescription
 
-        \(imageDescription)
-        """
+        if let hint = fishHint, !hint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += "\n\n사용자 어종 힌트: \(hint)"
+        }
 
-        if let hint = fishHint, !hint.trimmingCharacters(in: .whitespaces).isEmpty {
-            prompt += "\n\nFish species hint from user: \(hint)"
-        } else {
-            prompt += "\n\nNo species hint provided. Attempt identification from the image signals."
+        if let topLabel = assessment.topSubjectLabel {
+            prompt += "\n\nVision 최상위 분류: \(topLabel)"
         }
 
         prompt += """
 
-        Evaluate:
-        1. Each freshness indicator (eyes, gills, scales, flesh, color)
-        2. Overall freshness score (1-5) and matching grade
-        3. Cooking recommendations appropriate for the freshness level
-        4. Safety advice for food consumption
-        5. A brief Korean summary
-
-        The photo quality is acceptable. Even if some indicators are not clearly visible, provide your best assessment. Never refuse to analyze.
+        위 이미지 신호를 바탕으로 생선 신선도를 분석하세요.
+        fishSpecies, observation, summary, cookingRecommendation, safetyAdvice는 모두 한국어로 작성하세요.
+        각 observation은 해당 항목(눈/아가미/비늘/살/색감)에 대해 서로 다르게 작성하세요.
         """
 
         return prompt
@@ -234,9 +256,14 @@ actor FreshnessAnalysisService {
     }
 
     private let defaultSystemPrompt = """
-    You are an expert fish freshness analyst helping shoppers assess food quality.
-    Evaluate fish freshness from image analysis data and return a structured assessment.
-    Always attempt analysis even with limited information. Write summary in Korean. Never refuse.
+    생선 신선도 전문가입니다. 이미지 분류 신호를 바탕으로 신선도를 평가합니다.
+    모든 텍스트 필드는 한국어로 작성하세요. 영어 지시문을 반복하지 마세요.
+
+    예시:
+    fishSpecies: 고등어
+    overallScore: 4
+    eyeCondition: { level: FRESH, observation: "눈이 맑고 볼록합니다." }
+    summary: "전반적으로 신선한 고등어입니다. 비늘이 윤기 있고 색감이 좋습니다."
     """
 }
 
@@ -248,6 +275,7 @@ enum AnalysisError: LocalizedError {
     case appleIntelligenceDisabled
     case deviceNotEligible
     case aiResponseInvalid
+    case notFishProduct(String)
     case analysisFailure(String)
     case saveFailed(String)
 
@@ -263,6 +291,8 @@ enum AnalysisError: LocalizedError {
             return "이 기기는 Apple Intelligence를 지원하지 않습니다."
         case .aiResponseInvalid:
             return "AI 분석 응답을 처리하지 못했습니다. Apple Intelligence 모델 상태를 확인해주세요."
+        case .notFishProduct(let detected):
+            return "생선 사진이 아닙니다. 감지된 내용: \(detected)"
         case .analysisFailure(let reason):
             return reason
         case .saveFailed(let reason):
@@ -278,6 +308,8 @@ enum AnalysisError: LocalizedError {
             return "Wi-Fi 연결 후 Apple Intelligence 모델 다운로드가 완료됐는지 확인하고, 앱을 재시작한 뒤 다시 시도해주세요."
         case .deviceNotEligible:
             return "iPhone 15 Pro 이상 또는 Apple Intelligence 지원 기기가 필요합니다."
+        case .notFishProduct:
+            return "생선이나 해산물 사진을 촬영하거나 선택해주세요."
         case .analysisFailure(let reason):
             if reason.contains("차단") || reason.contains("거부") {
                 return "다른 사진으로 다시 시도해보세요."
