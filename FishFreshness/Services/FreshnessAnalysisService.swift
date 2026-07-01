@@ -152,15 +152,12 @@ actor FreshnessAnalysisService {
             prompt += "\n\n사용자 어종 힌트: \(hint)"
         }
 
-        if let topLabel = assessment.topSubjectLabel {
-            prompt += "\n\nVision 최상위 분류: \(topLabel)"
-        }
-
         prompt += """
 
         위 이미지 신호를 바탕으로 생선 신선도를 분석하세요.
         fishSpecies, observation, summary, cookingRecommendation, safetyAdvice는 모두 한국어로 작성하세요.
         각 observation은 해당 항목(눈/아가미/비늘/살/색감)에 대해 서로 다르게 작성하세요.
+        Core ML 어종 분류가 없으면 fishSpecies는 반드시 "어종 미상"으로 작성하세요.
         """
 
         return prompt
@@ -256,14 +253,10 @@ actor FreshnessAnalysisService {
     }
 
     private let defaultSystemPrompt = """
-    생선 신선도 전문가입니다. 이미지 분류 신호를 바탕으로 신선도를 평가합니다.
+    생선 신선도 전문가입니다. Vision 분류 신호와 색상 신호를 바탕으로 신선도를 평가합니다.
     모든 텍스트 필드는 한국어로 작성하세요. 영어 지시문을 반복하지 마세요.
-
-    예시:
-    fishSpecies: 고등어
-    overallScore: 4
-    eyeCondition: { level: FRESH, observation: "눈이 맑고 볼록합니다." }
-    summary: "전반적으로 신선한 고등어입니다. 비늘이 윤기 있고 색감이 좋습니다."
+    Vision 라벨에 없는 어종명을 추측해서 쓰지 마세요. 라벨이 없으면 "어종 미상"으로 표기하세요.
+    신호가 불분명하면 overallScore 3으로, summary에 "정확한 평가 어려움" 포함.
     """
 }
 

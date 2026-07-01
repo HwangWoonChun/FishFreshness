@@ -1,6 +1,7 @@
 import UIKit
 import CoreImage
 import Vision
+import CoreML
 
 // MARK: - Image Content Assessment
 
@@ -10,6 +11,10 @@ struct ImageContentAssessment: Sendable {
     let dimensions: String
     let brightness: String
     let aspectRatio: String
+    let freshnessLabel: String?
+    let freshnessConfidence: Float
+    let speciesLabel: String?
+    let speciesConfidence: Float
 
     var topSubjectLabel: String? {
         classifications.first?.label
@@ -38,8 +43,10 @@ struct ImageContentAssessment: Sendable {
     }
 
     var shouldRejectAsNonFish: Bool {
-        guard !classifications.isEmpty else { return false }
-        return nonFishFoodConfidence >= 0.12 && fishConfidence < 0.08
+        guard !classifications.isEmpty else { return true }
+        if fishConfidence < 0.08 { return true }
+        if nonFishFoodConfidence >= 0.12 { return true }
+        return false
     }
 
     var promptDescription: String {
@@ -56,9 +63,19 @@ struct ImageContentAssessment: Sendable {
             """
         }
 
+        var coreMLBlock = ""
+        // 어종은 신뢰도 75% 이상일 때만 사용 (낮으면 오히려 오해 유발)
+        if let species = speciesLabel, speciesConfidence >= 0.75 {
+            coreMLBlock += "\nCore ML 어종 분류: \(species) (신뢰도 \(Int(speciesConfidence * 100))%)"
+        }
+        // 신선도는 신뢰도 70% 이상일 때만 사용
+        if let freshness = freshnessLabel, freshnessConfidence >= 0.70 {
+            coreMLBlock += "\nCore ML 신선도 판정: \(freshness) (신뢰도 \(Int(freshnessConfidence * 100))%)"
+        }
+
         return """
         === IMAGE SIGNALS ===
-        \(classificationBlock)
+        \(classificationBlock)\(coreMLBlock)
 
         Dimensions: \(dimensions)
         Brightness: \(brightness)
@@ -67,6 +84,9 @@ struct ImageContentAssessment: Sendable {
         === END IMAGE SIGNALS ===
         """
     }
+
+    static func isFishLabel(_ label: String) -> Bool { matchesFishLabel(label) }
+    static func isNonFishFoodLabel(_ label: String) -> Bool { matchesNonFishFoodLabel(label) }
 
     private static func matchesFishLabel(_ label: String) -> Bool {
         let normalized = label.lowercased().replacingOccurrences(of: "_", with: " ")
@@ -104,7 +124,11 @@ nonisolated struct VisionPreprocessingService: Sendable {
                 colors: "unknown",
                 dimensions: "invalid image",
                 brightness: "unknown",
-                aspectRatio: "unknown"
+                aspectRatio: "unknown",
+                freshnessLabel: nil,
+                freshnessConfidence: 0,
+                speciesLabel: nil,
+                speciesConfidence: 0
             )
         }
 
@@ -117,13 +141,45 @@ nonisolated struct VisionPreprocessingService: Sendable {
         let brightness = describeOverallBrightness(cgImage)
         let aspectRatio = describeAspectRatio(width: cgImage.width, height: cgImage.height)
 
+        let (freshnessLabel, freshnessConfidence) = predictFreshness(from: cgImage)
+        let (speciesLabel, speciesConfidence) = predictSpecies(from: cgImage)
+
+        print("[Vision] classifications: \(classifications.prefix(5).map { "\($0.label)=\(String(format: "%.2f", $0.confidence))" }.joined(separator: ", "))")
+        print("[Vision] fishConfidence=\(classifications.filter { ImageContentAssessment.isFishLabel($0.label) }.map(\.confidence).max() ?? 0), nonFishConfidence=\(classifications.filter { ImageContentAssessment.isNonFishFoodLabel($0.label) }.map(\.confidence).max() ?? 0)")
+
         return ImageContentAssessment(
             classifications: classifications,
             colors: colors,
             dimensions: dimensions,
             brightness: brightness,
-            aspectRatio: aspectRatio
+            aspectRatio: aspectRatio,
+            freshnessLabel: freshnessLabel,
+            freshnessConfidence: freshnessConfidence,
+            speciesLabel: speciesLabel,
+            speciesConfidence: speciesConfidence
         )
+    }
+
+    private func predictFreshness(from cgImage: CGImage) -> (label: String?, confidence: Float) {
+        guard let model = try? fishness(configuration: MLModelConfiguration()),
+              let pixelBuffer = cgImage.toPixelBuffer(width: 299, height: 299) else {
+            return (nil, 0)
+        }
+        guard let output = try? model.prediction(image: pixelBuffer) else { return (nil, 0) }
+        let label = output.target
+        let confidence = Float(output.targetProbability[label] ?? 0)
+        return (label, confidence)
+    }
+
+    private func predictSpecies(from cgImage: CGImage) -> (label: String?, confidence: Float) {
+        guard let model = try? specific(configuration: MLModelConfiguration()),
+              let pixelBuffer = cgImage.toPixelBuffer(width: 299, height: 299) else {
+            return (nil, 0)
+        }
+        guard let output = try? model.prediction(image: pixelBuffer) else { return (nil, 0) }
+        let label = output.target
+        let confidence = Float(output.targetProbability[label] ?? 0)
+        return (label, confidence)
     }
 
     // MARK: - Vision Classification
@@ -341,5 +397,36 @@ enum ImageProcessing {
             )
         }
         return CGSize(width: cgImage.width, height: cgImage.height)
+    }
+}
+
+// MARK: - CGImage → CVPixelBuffer
+
+private extension CGImage {
+    func toPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                  kCVPixelFormatType_32ARGB, attrs as CFDictionary,
+                                  &buffer) == kCVReturnSuccess,
+              let pixelBuffer = buffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(pixelBuffer),
+            width: width, height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        ) else { return nil }
+
+        context.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return pixelBuffer
     }
 }
